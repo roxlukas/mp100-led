@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""mp100-led - sterowanie podświetleniem LED mini-PC MP100 (Shenzhen DOKE) pod Linuksem.
+
+Protokół odczytany z oryginalnego ledcontrol.exe (Windows, .NET):
+  * USB-serial CH340 (1a86:7523), 10000 baud, 8N1
+  * ramka 5 bajtów: 0xFA, tryb, jasność, prędkość, suma kontrolna
+      suma = (0xFA + tryb + jasność + prędkość) & 0xFF
+  * jasność i prędkość na linii: 1 = max ... 5 = min (odwrotnie niż w GUI)
+  * każdy bajt wysyłany osobno, z odstępem ~5 ms; port otwierany na czas ramki
+  * tryby: 1 tęcza, 2 oddychanie, 3 cykl kolorów, 4 wyłączone, 5 auto
+
+Polecenia:
+  mp100-led set MODE [-b 1-5] [-s 1-5]   ustaw tryb (nazwa lub numer 0-255)
+  mp100-led raw B1 B2 B3                 wyślij surowe bajty tryb/jasność/prędkość
+  mp100-led probe [--from N --to M]      przejdź po numerach trybów (szukanie ukrytych)
+  mp100-led monitor [-c PLIK]            sygnalizuj obciążenie maszyny
+  mp100-led status                       pokaż wykryty port i bieżące obciążenie
+"""
+
+import argparse
+import configparser
+import glob
+import os
+import signal
+import sys
+import time
+
+MODES = {
+    "rainbow": 1,
+    "breathing": 2,
+    "cycle": 3,
+    "off": 4,
+    "auto": 5,
+}
+MODE_NAMES = {v: k for k, v in MODES.items()}
+
+BAUD = 10000
+BYTE_DELAY = 0.005
+USB_IDS = {("1a86", "7523")}  # QinHeng CH340
+DEFAULT_CONFIG = "/etc/mp100-led.conf"
+
+
+# ---------------------------------------------------------------- urządzenie
+
+def find_device():
+    """Znajdź port szeregowy kontrolera LED."""
+    if os.path.exists("/dev/mp100-led"):  # symlink z reguły udev
+        return "/dev/mp100-led"
+    for tty in sorted(glob.glob("/sys/class/tty/ttyUSB*")):
+        dev = os.path.realpath(os.path.join(tty, "device"))
+        # szukaj idVendor/idProduct w górę drzewa sysfs
+        for _ in range(4):
+            dev = os.path.dirname(dev)
+            try:
+                with open(os.path.join(dev, "idVendor")) as f:
+                    vid = f.read().strip()
+                with open(os.path.join(dev, "idProduct")) as f:
+                    pid = f.read().strip()
+            except OSError:
+                continue
+            if (vid, pid) in USB_IDS:
+                return "/dev/" + os.path.basename(tty)
+            break
+    return None
+
+
+def frame(mode, brightness_wire, speed_wire):
+    b = [0xFA, mode & 0xFF, brightness_wire & 0xFF, speed_wire & 0xFF]
+    b.append(sum(b) & 0xFF)
+    return bytes(b)
+
+
+def send_raw(device, mode, brightness_wire, speed_wire):
+    try:
+        import serial
+    except ImportError:
+        sys.exit("Brak modułu pyserial: sudo apt install python3-serial")
+    data = frame(mode, brightness_wire, speed_wire)
+    try:
+        port = serial.Serial(device, BAUD, bytesize=8, parity="N", stopbits=1,
+                             timeout=0.2, write_timeout=1)
+    except serial.SerialException as e:
+        if "Permission denied" in str(e):
+            sys.exit(f"Brak dostępu do {device}. Zainstaluj regułę udev (install.sh) "
+                     "albo dodaj użytkownika do grupy dialout.")
+        raise
+    try:
+        for byte in data:
+            time.sleep(BYTE_DELAY)
+            port.write(bytes([byte]))
+        port.flush()
+    finally:
+        port.close()
+    return data
+
+
+def level_to_wire(value):
+    """1..5 (5 = najjaśniej/najszybciej) -> wartość na linii 5..1."""
+    value = max(1, min(5, int(value)))
+    return 6 - value
+
+
+def parse_mode(text):
+    text = str(text).strip().lower()
+    if text in MODES:
+        return MODES[text]
+    try:
+        n = int(text, 0)
+    except ValueError:
+        sys.exit(f"Nieznany tryb '{text}'. Dostępne: {', '.join(MODES)} lub numer 0-255")
+    if not 0 <= n <= 255:
+        sys.exit("Numer trybu musi być w zakresie 0-255")
+    return n
+
+
+def parse_state(spec):
+    """'breathing:4:5' -> (tryb, jasność 1-5, prędkość 1-5)."""
+    parts = spec.split(":")
+    mode = parse_mode(parts[0])
+    bri = int(parts[1]) if len(parts) > 1 and parts[1] else 3
+    spd = int(parts[2]) if len(parts) > 2 and parts[2] else 3
+    return mode, bri, spd
+
+
+def send_state(device, mode, bri, spd):
+    return send_raw(device, mode, level_to_wire(bri), level_to_wire(spd))
+
+
+# ---------------------------------------------------------------- metryki
+
+class CpuMeter:
+    """Zajętość CPU w % liczona z /proc/stat między kolejnymi odczytami."""
+
+    def __init__(self):
+        self.prev = self._read()
+
+    @staticmethod
+    def _read():
+        with open("/proc/stat") as f:
+            vals = [int(x) for x in f.readline().split()[1:]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+        return sum(vals[:8]), idle  # bez guest (już wliczone w user)
+
+    def read(self):
+        total, idle = self._read()
+        pt, pi = self.prev
+        self.prev = (total, idle)
+        dt = total - pt
+        return 0.0 if dt <= 0 else 100.0 * (dt - (idle - pi)) / dt
+
+
+def read_loadavg_pct():
+    with open("/proc/loadavg") as f:
+        load1 = float(f.read().split()[0])
+    return 100.0 * load1 / (os.cpu_count() or 1)
+
+
+CPU_HWMON = ("k10temp", "coretemp", "zenpower", "cpu_thermal")
+
+
+def read_temp():
+    """Temperatura CPU (°C): hwmon k10temp/coretemp, a gdy brak - strefy termiczne."""
+    paths = []
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(hw, "name")) as f:
+                if f.read().strip() in CPU_HWMON:
+                    paths += glob.glob(os.path.join(hw, "temp*_input"))
+        except OSError:
+            continue
+    if not paths:
+        paths = glob.glob("/sys/class/thermal/thermal_zone*/temp")
+    best = None
+    for path in paths:
+        try:
+            with open(path) as f:
+                t = int(f.read().strip()) / 1000.0
+        except (OSError, ValueError):
+            continue
+        if 0 < t < 150 and (best is None or t > best):
+            best = t
+    return best if best is not None else 0.0
+
+
+# ---------------------------------------------------------------- monitor
+
+DEFAULTS = {
+    "device": "auto",
+    # cpu = zajętość CPU %, load = loadavg(1 min) / liczba rdzeni * 100 %, temp = °C
+    "metric": "cpu",
+    "interval": "2",
+    # wygładzanie wykładnicze: 1.0 = brak, mniejsze = wolniejsza reakcja
+    "smoothing": "0.4",
+    # progi przejść między poziomami 0|1|2|3 (dla temp w °C)
+    "thresholds": "50, 75, 90",
+    # o ile wartość musi spaść poniżej progu, żeby zejść poziom niżej
+    "hysteresis": "5",
+    # stan LED dla każdego poziomu: tryb:jasność(1-5):prędkość(1-5)
+    # tryb to nazwa (rainbow, breathing, cycle, off, auto) albo numer.
+    # Kolory w nazwach to cel docelowy - zob. README (stały kolor).
+    "level0": "cycle:1:1",
+    "level1": "breathing:3:2",
+    "level2": "breathing:5:4",
+    "level3": "rainbow:5:5",
+    # stan po zatrzymaniu monitora (pusty = nie zmieniaj)
+    "on_exit": "rainbow:3:3",
+    # ponawiaj wysłanie bieżącego stanu co N s (0 = tylko przy zmianie)
+    "refresh": "300",
+}
+
+
+def load_config(path):
+    cp = configparser.ConfigParser()
+    cp.read_dict({"monitor": DEFAULTS})
+    if path and os.path.exists(path):
+        cp.read(path)
+    return cp["monitor"]
+
+
+def compute_level(value, current, thresholds, hysteresis):
+    target = sum(1 for t in thresholds if value >= t)
+    if target < current:
+        # schodź niżej dopiero gdy wartość spadnie wyraźnie poniżej progu
+        while target < current and value < thresholds[current - 1] - hysteresis:
+            current -= 1
+        return current
+    return target
+
+
+def cmd_monitor(args):
+    cfg = load_config(args.config)
+    device = args.device or (None if cfg["device"] == "auto" else cfg["device"]) or find_device()
+    if not device:
+        sys.exit("Nie znaleziono kontrolera LED (CH340 1a86:7523).")
+    metric = cfg["metric"].strip().lower()
+    interval = float(cfg["interval"])
+    alpha = float(cfg["smoothing"])
+    thresholds = sorted(float(x) for x in cfg["thresholds"].split(","))
+    hysteresis = float(cfg["hysteresis"])
+    levels = [parse_state(cfg[f"level{i}"]) for i in range(len(thresholds) + 1)]
+    refresh = float(cfg["refresh"])
+    on_exit = cfg["on_exit"].strip()
+
+    if metric == "cpu":
+        meter = CpuMeter()
+        reader = meter.read
+    elif metric == "load":
+        reader = read_loadavg_pct
+    elif metric == "temp":
+        reader = read_temp
+    else:
+        sys.exit(f"Nieznana metryka '{metric}' (cpu, load, temp)")
+
+    def stop(signum, _frame):
+        if on_exit:
+            try:
+                send_state(device, *parse_state(on_exit))
+            except Exception as e:  # noqa: BLE001
+                print(f"Nie udało się przywrócić stanu: {e}", file=sys.stderr)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    print(f"mp100-led: {device}, metryka={metric}, progi={thresholds}", flush=True)
+    time.sleep(min(interval, 1.0))
+    smooth = reader()
+    level = -1
+    last_sent = 0.0
+    while True:
+        smooth = alpha * reader() + (1 - alpha) * smooth
+        new = compute_level(smooth, max(level, 0), thresholds, hysteresis)
+        now = time.monotonic()
+        if new != level or (refresh > 0 and now - last_sent >= refresh):
+            if new != level:
+                print(f"{metric}={smooth:5.1f} -> poziom {new} "
+                      f"({cfg[f'level{new}']})", flush=True)
+            try:
+                send_state(device, *levels[new])
+                level = new
+                last_sent = now
+            except Exception as e:  # noqa: BLE001 - port może zniknąć chwilowo
+                print(f"Błąd wysyłania: {e}", file=sys.stderr, flush=True)
+                device = find_device() or device
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------- polecenia
+
+def need_device(args):
+    dev = args.device or find_device()
+    if not dev:
+        sys.exit("Nie znaleziono kontrolera LED (CH340 1a86:7523). Podaj --device.")
+    return dev
+
+
+def cmd_set(args):
+    dev = need_device(args)
+    mode = parse_mode(args.mode)
+    data = send_state(dev, mode, args.brightness, args.speed)
+    if args.verbose:
+        print(f"{dev}: {data.hex(' ')}")
+
+
+def cmd_raw(args):
+    dev = need_device(args)
+    data = send_raw(dev, args.mode, args.b, args.s)
+    print(f"{dev}: {data.hex(' ')}")
+
+
+def cmd_probe(args):
+    dev = need_device(args)
+    print("Obserwuj diodę. Ctrl+C przerywa. Zapisz numery, które dają stały kolor.")
+    try:
+        for m in range(args.start, args.end + 1):
+            name = MODE_NAMES.get(m, "?")
+            data = send_raw(dev, m, level_to_wire(args.brightness), level_to_wire(args.speed))
+            print(f"tryb {m:3d} (0x{m:02x}) {name:9s} ramka {data.hex(' ')}", flush=True)
+            time.sleep(args.delay)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        send_state(dev, *parse_state(args.restore))
+
+
+def cmd_status(args):
+    dev = args.device or find_device()
+    print(f"port:     {dev or 'nie znaleziono'}")
+    if dev:
+        print(f"dostęp:   {'tak' if os.access(dev, os.R_OK | os.W_OK) else 'NIE'}")
+    meter = CpuMeter()
+    time.sleep(1)
+    print(f"cpu:      {meter.read():.1f} %")
+    print(f"load:     {read_loadavg_pct():.1f} % ({os.cpu_count()} rdzeni)")
+    print(f"temp:     {read_temp():.1f} °C")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="mp100-led", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-d", "--device", help="port szeregowy (domyślnie autodetekcja)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("set", help="ustaw tryb")
+    s.add_argument("mode", help=f"{', '.join(MODES)} lub numer")
+    s.add_argument("-b", "--brightness", type=int, default=3, choices=range(1, 6),
+                   metavar="1-5", help="jasność (5 = max)")
+    s.add_argument("-s", "--speed", type=int, default=3, choices=range(1, 6),
+                   metavar="1-5", help="prędkość (5 = max)")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(func=cmd_set)
+
+    r = sub.add_parser("raw", help="surowe bajty tryb/jasność/prędkość (0-255)")
+    for name in ("mode", "b", "s"):
+        r.add_argument(name, type=lambda x: int(x, 0))
+    r.set_defaults(func=cmd_raw)
+
+    pr = sub.add_parser("probe", help="testuj kolejne numery trybów")
+    pr.add_argument("--from", dest="start", type=int, default=0)
+    pr.add_argument("--to", dest="end", type=int, default=32)
+    pr.add_argument("--delay", type=float, default=4.0)
+    pr.add_argument("-b", "--brightness", type=int, default=5)
+    pr.add_argument("-s", "--speed", type=int, default=3)
+    pr.add_argument("--restore", default="rainbow:3:3")
+    pr.set_defaults(func=cmd_probe)
+
+    m = sub.add_parser("monitor", help="sygnalizuj obciążenie")
+    m.add_argument("-c", "--config", default=DEFAULT_CONFIG)
+    m.set_defaults(func=cmd_monitor)
+
+    st = sub.add_parser("status", help="port i bieżące metryki")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+# Kontroler LED mini-PC MP100 (CH340): dostęp dla grupy plugdev + stała nazwa /dev/mp100-led
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0660", GROUP="plugdev", SYMLINK+="mp100-led"

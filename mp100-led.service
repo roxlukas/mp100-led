@@ -1,0 +1,16 @@
+[Unit]
+Description=MP100 LED - sygnalizacja obciążenia
+
+[Service]
+ExecStart=/usr/local/bin/mp100-led monitor -c /etc/mp100-led.conf
+Restart=on-failure
+RestartSec=5
+DynamicUser=yes
+SupplementaryGroups=plugdev dialout
+DeviceAllow=char-ttyUSB rw
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
