@@ -46,3 +46,7 @@ Gdy `probe` znajdzie tryby ze stałym kolorem, wpisz ich numery do `level0`–`l
 sudo systemctl enable --now mp100-led
 journalctl -u mp100-led -f
 ```
+
+## Licencja
+
+MIT — szczegóły w pliku [LICENSE](LICENSE).
