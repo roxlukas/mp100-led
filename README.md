@@ -1,4 +1,4 @@
-# mp100-led — LED mini-PC MP100 pod Linuksem
+# mp100-led — RGB dla Blackview MP100 pod Linuksem
 
 Linuksowy odpowiednik dołączonego `ledcontrol.exe` oraz monitor obciążenia.
 
